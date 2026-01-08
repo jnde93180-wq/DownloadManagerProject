@@ -1,0 +1,13 @@
+﻿{
+  "manifest_version": 3,
+  "name": "Send to Download Manager (Local)",
+  "version": "0.2",
+  "description": "Send current page URL to local Download Manager (localhost:8765).",
+  "permissions": ["contextMenus", "activeTab", "scripting"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Send to Download Manager"
+  }
+}

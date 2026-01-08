@@ -1,0 +1,21 @@
+﻿{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Download Manager",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "env": {}
+    },
+    {
+      "name": "Run Test Server",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_server.py",
+      "console": "integratedTerminal",
+      "env": {}
+    }
+  ]
+}
