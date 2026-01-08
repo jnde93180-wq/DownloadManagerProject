@@ -64,6 +64,7 @@ class DownloadItem:
     max_bandwidth: Optional[int] = None
     retries: int = 3
     quality: str = "Best"
+    file_format: Optional[str] = None
 
     is_torrent: bool = False
     is_ytdlp: bool = False
@@ -140,11 +141,15 @@ class DB:
                 checksum_sha256 TEXT, scheduled_time TEXT, auth_username TEXT,
                 auth_password TEXT, cookies_raw TEXT, proxy TEXT,
                 max_bandwidth INTEGER, retries INTEGER, is_torrent INTEGER, is_ytdlp INTEGER,
-                state TEXT, downloaded INTEGER, total INTEGER, quality TEXT
+                state TEXT, downloaded INTEGER, total INTEGER, quality TEXT, file_format TEXT
             )
         """)
         try:
             await self._conn.execute("ALTER TABLE downloads ADD COLUMN quality TEXT")
+        except Exception:
+            pass
+        try:
+            await self._conn.execute("ALTER TABLE downloads ADD COLUMN file_format TEXT")
         except Exception:
             pass
         await self._conn.commit()
@@ -154,24 +159,24 @@ class DB:
             await self._conn.execute("""
                 UPDATE downloads SET url=?, filename=?, dest_folder=?, segments=?, checksum_sha256=?,
                     scheduled_time=?, auth_username=?, auth_password=?, cookies_raw=?, proxy=?,
-                    max_bandwidth=?, retries=?, is_torrent=?, is_ytdlp=?, state=?, downloaded=?, total=?, quality=? WHERE id=?
+                    max_bandwidth=?, retries=?, is_torrent=?, is_ytdlp=?, state=?, downloaded=?, total=?, quality=?, file_format=? WHERE id=?
             """, (item.url, item.filename, item.dest_folder, item.segments, item.checksum_sha256,
                   item.scheduled_time.isoformat() if item.scheduled_time else None,
                   item.auth_username, item.auth_password, item.cookies_raw, item.proxy,
                   item.max_bandwidth, item.retries, int(item.is_torrent), int(item.is_ytdlp),
-                  item.state, item.downloaded, item.total, item.quality, item.id))
+                  item.state, item.downloaded, item.total, item.quality, item.file_format, item.id))
             await self._conn.commit()
         else:
             cur = await self._conn.execute("""
                 INSERT INTO downloads (url, filename, dest_folder, segments, checksum_sha256,
                     scheduled_time, auth_username, auth_password, cookies_raw, proxy,
-                    max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total, quality)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total, quality, file_format)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (item.url, item.filename, item.dest_folder, item.segments, item.checksum_sha256,
                   item.scheduled_time.isoformat() if item.scheduled_time else None,
                   item.auth_username, item.auth_password, item.cookies_raw, item.proxy,
                   item.max_bandwidth, item.retries, int(item.is_torrent), int(item.is_ytdlp),
-                  item.state, item.downloaded, item.total, item.quality))
+                  item.state, item.downloaded, item.total, item.quality, item.file_format))
             await self._conn.commit()
             item.id = cur.lastrowid
 
@@ -188,7 +193,7 @@ class DB:
             (id_, url, filename, dest_folder, segments, checksum_sha256,
              scheduled_time, auth_username, auth_password, cookies_raw,
 
-             proxy, max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total, quality) = r
+             proxy, max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total, quality, file_format) = r
             item = DownloadItem(
                 id=id_,
                 url=url,
@@ -208,7 +213,8 @@ class DB:
                 state=state or "queued",
                 downloaded=downloaded or 0,
                 total=total,
-                quality=quality or "Best"
+                quality=quality or "Best",
+                file_format=file_format
             )
             item._pause_event = asyncio.Event()
             if item.state != "paused":
@@ -594,6 +600,17 @@ class DownloadManager:
             'noplaylist': True,
             'no_color': True,
         }
+
+        # Conversion logic
+        if it.file_format:
+            if it.quality == 'Audio Only':
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': it.file_format,
+                    'preferredquality': '192',
+                }]
+            else:
+                ydl_opts['merge_output_format'] = it.file_format
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -688,7 +705,14 @@ class AddDialog(QDialog):
         self.retries_spin = QSpinBox(); self.retries_spin.setRange(0, 20); self.retries_spin.setValue(3)
 
         self.quality_combo = QComboBox()
-        self.quality_combo.addItems(["Best", "1080p", "720p", "Audio Only"])
+        self.quality_combo.addItems(["Select Quality...", "Best", "1080p", "720p", "Audio Only"])
+        
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["Select Format..."])
+        self.format_combo.setEnabled(False)
+
+        self.quality_combo.currentTextChanged.connect(self.on_quality_changed)
+        
         self.is_torrent_cb = QCheckBox("Is torrent / magnet")
         form.addRow("URL:", self.url_edit)
         form.addRow("Filename (optional):", self.filename_edit)
@@ -699,6 +723,7 @@ class AddDialog(QDialog):
         form.addRow("Retries:", self.retries_spin)
 
         form.addRow("Quality (Youtube):", self.quality_combo)
+        form.addRow("Format (Youtube):", self.format_combo)
         form.addRow("Checksum (SHA256):", self.checksum_edit)
         form.addRow("Schedule:", self.schedule_dt)
         form.addRow("Auth username:", self.auth_user); form.addRow("Auth password:", self.auth_pass)
@@ -711,11 +736,37 @@ class AddDialog(QDialog):
         self.browse_btn.clicked.connect(self.on_browse)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
+        
+        # Initial validation check
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(True) 
+
+    def on_quality_changed(self, text):
+        self.format_combo.clear()
+        if text == "Select Quality...":
+            self.format_combo.addItem("Select Format...")
+            self.format_combo.setEnabled(False)
+        elif text == "Audio Only":
+            self.format_combo.setEnabled(True)
+            self.format_combo.addItems(["mp3", "m4a", "wav"])
+        else: # Video
+            self.format_combo.setEnabled(True)
+            self.format_combo.addItems(["mp4", "mkv", "webm"])
 
     def on_browse(self):
         folder = QFileDialog.getExistingDirectory(self, "Select destination folder", self.dest_edit.text())
         if folder:
             self.dest_edit.setText(folder)
+
+    def accept(self):
+        # Validate inputs
+        if self.url_edit.text().strip() and ("youtube" in self.url_edit.text().strip() or "youtu.be" in self.url_edit.text().strip()):
+             if self.quality_combo.currentText() == "Select Quality...":
+                 QMessageBox.warning(self, "Invalid Selection", "Please select a Quality.")
+                 return
+             if self.format_combo.currentText() == "Select Format..." or not self.format_combo.currentText():
+                 QMessageBox.warning(self, "Invalid Selection", "Please select a Format.")
+                 return
+        super().accept()
 
     def get_data(self):
         if self.exec() != QDialog.Accepted:
@@ -726,6 +777,12 @@ class AddDialog(QDialog):
         filename = self.filename_edit.text().strip() or os.path.basename(url.split("?",1)[0]) or f"dl_{int(datetime.now().timestamp())}"
         scheduled = self.schedule_dt.dateTime().toPython()
         bw = self.bandwidth_spin.value()
+        
+        quality = self.quality_combo.currentText()
+        if quality == "Select Quality...": quality = "Best" # Fallback if validation bypassed (shouldn't happen)
+        file_fmt = self.format_combo.currentText()
+        if not file_fmt or file_fmt == "Select Format...": file_fmt = None
+
         return {
             "url": url,
             "filename": filename,
@@ -740,7 +797,8 @@ class AddDialog(QDialog):
             "max_bandwidth": bw * 1024 if bw else None,
             "retries": self.retries_spin.value(),
 
-            "quality": self.quality_combo.currentText(),
+            "quality": quality,
+            "file_format": file_fmt,
             "is_torrent": self.is_torrent_cb.isChecked()
         }
 
@@ -851,6 +909,8 @@ class MainWindow(QWidget):
             proxy=data["proxy"],
             max_bandwidth=data["max_bandwidth"],
             retries=data["retries"],
+            quality=data["quality"],
+            file_format=data["file_format"],
             is_torrent=data["is_torrent"]
         )
         self.manager.add_item(item)
