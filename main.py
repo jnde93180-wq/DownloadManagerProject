@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel,
     QLineEdit, QTableWidget, QTableWidgetItem, QProgressBar, QMessageBox,
     QSpinBox, QFileDialog, QHeaderView, QDialog, QFormLayout, QTextEdit,
-    QDateTimeEdit, QCheckBox, QDialogButtonBox
+    QDateTimeEdit, QCheckBox, QDialogButtonBox, QComboBox
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QClipboard
@@ -43,6 +43,11 @@ DEFAULT_SEGMENTS = 4
 DEFAULT_CHUNK = 64 * 1024  # 64 KB
 HTTP_SERVER_PORT = 8765
 
+# Add local ffmpeg to PATH
+ffmpeg_path = os.path.join(os.path.dirname(__file__), "ffmpeg")
+if os.path.exists(ffmpeg_path):
+    os.environ["PATH"] += os.pathsep + ffmpeg_path
+
 @dataclass
 class DownloadItem:
     id: int = 0
@@ -58,6 +63,7 @@ class DownloadItem:
     proxy: Optional[str] = None
     max_bandwidth: Optional[int] = None
     retries: int = 3
+    quality: str = "Best"
 
     is_torrent: bool = False
     is_ytdlp: bool = False
@@ -134,9 +140,13 @@ class DB:
                 checksum_sha256 TEXT, scheduled_time TEXT, auth_username TEXT,
                 auth_password TEXT, cookies_raw TEXT, proxy TEXT,
                 max_bandwidth INTEGER, retries INTEGER, is_torrent INTEGER, is_ytdlp INTEGER,
-                state TEXT, downloaded INTEGER, total INTEGER
+                state TEXT, downloaded INTEGER, total INTEGER, quality TEXT
             )
         """)
+        try:
+            await self._conn.execute("ALTER TABLE downloads ADD COLUMN quality TEXT")
+        except Exception:
+            pass
         await self._conn.commit()
 
     async def save_item(self, item: DownloadItem):
@@ -144,24 +154,24 @@ class DB:
             await self._conn.execute("""
                 UPDATE downloads SET url=?, filename=?, dest_folder=?, segments=?, checksum_sha256=?,
                     scheduled_time=?, auth_username=?, auth_password=?, cookies_raw=?, proxy=?,
-                    max_bandwidth=?, retries=?, is_torrent=?, is_ytdlp=?, state=?, downloaded=?, total=? WHERE id=?
+                    max_bandwidth=?, retries=?, is_torrent=?, is_ytdlp=?, state=?, downloaded=?, total=?, quality=? WHERE id=?
             """, (item.url, item.filename, item.dest_folder, item.segments, item.checksum_sha256,
                   item.scheduled_time.isoformat() if item.scheduled_time else None,
                   item.auth_username, item.auth_password, item.cookies_raw, item.proxy,
                   item.max_bandwidth, item.retries, int(item.is_torrent), int(item.is_ytdlp),
-                  item.state, item.downloaded, item.total, item.id))
+                  item.state, item.downloaded, item.total, item.quality, item.id))
             await self._conn.commit()
         else:
             cur = await self._conn.execute("""
                 INSERT INTO downloads (url, filename, dest_folder, segments, checksum_sha256,
                     scheduled_time, auth_username, auth_password, cookies_raw, proxy,
-                    max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total, quality)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (item.url, item.filename, item.dest_folder, item.segments, item.checksum_sha256,
                   item.scheduled_time.isoformat() if item.scheduled_time else None,
                   item.auth_username, item.auth_password, item.cookies_raw, item.proxy,
                   item.max_bandwidth, item.retries, int(item.is_torrent), int(item.is_ytdlp),
-                  item.state, item.downloaded, item.total))
+                  item.state, item.downloaded, item.total, item.quality))
             await self._conn.commit()
             item.id = cur.lastrowid
 
@@ -178,7 +188,7 @@ class DB:
             (id_, url, filename, dest_folder, segments, checksum_sha256,
              scheduled_time, auth_username, auth_password, cookies_raw,
 
-             proxy, max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total) = r
+             proxy, max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total, quality) = r
             item = DownloadItem(
                 id=id_,
                 url=url,
@@ -197,7 +207,8 @@ class DB:
                 is_ytdlp=bool(is_ytdlp) if is_ytdlp is not None else False,
                 state=state or "queued",
                 downloaded=downloaded or 0,
-                total=total
+                total=total,
+                quality=quality or "Best"
             )
             item._pause_event = asyncio.Event()
             if item.state != "paused":
@@ -533,20 +544,26 @@ class DownloadManager:
         self.ui_update(it.id)
 
     def _run_ytdlp_blocking(self, it: DownloadItem):
+        import time
         def progress_hook(d):
+            # Check cancel
+            if it._cancel_event and it._cancel_event.is_set():
+                raise Exception("CancelledByUser")
+
+            # Check pause - block immediately
+            if it._pause_event:
+                while not it._pause_event.is_set():
+                     if it._cancel_event and it._cancel_event.is_set():
+                         raise Exception("CancelledByUser")
+                     time.sleep(0.5)
+
             if d['status'] == 'downloading':
-                if it._cancel_event and it._cancel_event.is_set():
-                    raise asyncio.CancelledError()
                 # Update stats
                 total = d.get('total_bytes') or d.get('total_bytes_estimate')
                 downloaded = d.get('downloaded_bytes', 0)
                 speed = d.get('speed')
                 
-                # We need to schedule these updates back to the loop
-                # but since we are in a thread, we can't await. 
-                # We'll just update the object and let the UI timer or next DB save pick it up?
-                # Actually, the DB save is async so we can't call it here easily without run_coroutine_threadsafe.
-                # For simplicity, we update the in-memory object.
+                # Update in-memory object
                 it.downloaded = downloaded or 0
                 it.total = total or 0
                 if total:
@@ -555,15 +572,27 @@ class DownloadManager:
                     it.speed = speed
             elif d['status'] == 'finished':
                 it.progress = 100.0
+                it.speed = 0.0
                 filename = d.get('filename')
                 if filename:
-                    # yt-dlp might have a different filename than we guessed
                     it.filename = os.path.basename(filename)
+
+
+        # Select format
+        format_sel = 'bestvideo+bestaudio/best'
+        if it.quality == '1080p':
+            format_sel = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+        elif it.quality == '720p':
+            format_sel = 'bestvideo[height<=720]+bestaudio/best[height<=720]'
+        elif it.quality == 'Audio Only':
+            format_sel = 'bestaudio/best'
 
         ydl_opts = {
             'outtmpl': os.path.join(it.dest_folder, '%(title)s.%(ext)s'),
+            'format': format_sel,
             'progress_hooks': [progress_hook],
             'noplaylist': True,
+            'no_color': True,
         }
         
         try:
@@ -657,6 +686,9 @@ class AddDialog(QDialog):
         self.proxy_edit = QLineEdit()
         self.bandwidth_spin = QSpinBox(); self.bandwidth_spin.setRange(0, 10_000_000); self.bandwidth_spin.setValue(0)
         self.retries_spin = QSpinBox(); self.retries_spin.setRange(0, 20); self.retries_spin.setValue(3)
+
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(["Best", "1080p", "720p", "Audio Only"])
         self.is_torrent_cb = QCheckBox("Is torrent / magnet")
         form.addRow("URL:", self.url_edit)
         form.addRow("Filename (optional):", self.filename_edit)
@@ -665,6 +697,8 @@ class AddDialog(QDialog):
         form.addRow("Segments:", self.segs_spin)
         form.addRow("Per-download bandwidth (KB/s, 0=none):", self.bandwidth_spin)
         form.addRow("Retries:", self.retries_spin)
+
+        form.addRow("Quality (Youtube):", self.quality_combo)
         form.addRow("Checksum (SHA256):", self.checksum_edit)
         form.addRow("Schedule:", self.schedule_dt)
         form.addRow("Auth username:", self.auth_user); form.addRow("Auth password:", self.auth_pass)
@@ -705,6 +739,8 @@ class AddDialog(QDialog):
             "proxy": self.proxy_edit.text().strip() or None,
             "max_bandwidth": bw * 1024 if bw else None,
             "retries": self.retries_spin.value(),
+
+            "quality": self.quality_combo.currentText(),
             "is_torrent": self.is_torrent_cb.isChecked()
         }
 
@@ -861,25 +897,85 @@ class MainWindow(QWidget):
         items = list(self.manager.items.values())
         self.table.setRowCount(len(items))
         for r, it in enumerate(items):
-            self.table.setItem(r, 0, QTableWidgetItem(str(it.id)))
-            self.table.setItem(r, 1, QTableWidgetItem(f"{it.filename}\n{it.url}"))
-            prog = QProgressBar()
+            # ID
+            item_id = self.table.item(r, 0)
+            if not item_id:
+                item_id = QTableWidgetItem(str(it.id))
+                self.table.setItem(r, 0, item_id)
+            else:
+                if item_id.text() != str(it.id):
+                    item_id.setText(str(it.id))
+
+            # Name/URL
+            item_name = self.table.item(r, 1)
+            txt = f"{it.filename}\n{it.url}"
+            if not item_name:
+                self.table.setItem(r, 1, QTableWidgetItem(txt))
+            else:
+                if item_name.text() != txt:
+                    item_name.setText(txt)
+
+            # Progress
+            prog = self.table.cellWidget(r, 2)
+            if not prog:
+                prog = QProgressBar()
+                self.table.setCellWidget(r, 2, prog)
             prog.setValue(int(it.progress or 0))
-            self.table.setCellWidget(r, 2, prog)
-            self.table.setItem(r, 3, QTableWidgetItem(f"{it.speed/1024:.1f} KB/s" if it.speed else ""))
-            self.table.setItem(r, 4, QTableWidgetItem(it.state))
-            self.table.setItem(r, 5, QTableWidgetItem(str(it.total) if it.total else ""))
+
+            # Speed
+            speed_str = f"{it.speed/1024:.1f} KB/s" if it.speed else ""
+            item_speed = self.table.item(r, 3)
+            if not item_speed:
+                self.table.setItem(r, 3, QTableWidgetItem(speed_str))
+            else:
+                if item_speed.text() != speed_str:
+                    item_speed.setText(speed_str)
+
+            # State
+            item_state = self.table.item(r, 4)
+            if not item_state:
+                self.table.setItem(r, 4, QTableWidgetItem(it.state))
+            else:
+                if item_state.text() != it.state:
+                   item_state.setText(it.state)
+
+            # Total
+            total_str = str(it.total) if it.total else ""
+            item_total = self.table.item(r, 5)
+            if not item_total:
+                self.table.setItem(r, 5, QTableWidgetItem(total_str))
+            else:
+                if item_total.text() != total_str:
+                    item_total.setText(total_str)
+
+            # Scheduled
             st = it.scheduled_time.strftime("%Y-%m-%d %H:%M:%S") if it.scheduled_time else ""
-            self.table.setItem(r, 6, QTableWidgetItem(st))
-            self.table.setItem(r, 7, QTableWidgetItem(it.error or ""))
-            aw = QWidget(); ah = QHBoxLayout(); ah.setContentsMargins(0,0,0,0)
-            start_btn = QPushButton("Start"); pause_btn = QPushButton("Pause"); cancel_btn = QPushButton("Cancel")
-            ah.addWidget(start_btn); ah.addWidget(pause_btn); ah.addWidget(cancel_btn)
-            aw.setLayout(ah)
-            start_btn.clicked.connect(lambda _, iid=it.id: self.manager.resume_item(iid))
-            pause_btn.clicked.connect(lambda _, iid=it.id: self.manager.pause_item(iid))
-            cancel_btn.clicked.connect(lambda _, iid=it.id: self._cancel(iid))
-            self.table.setCellWidget(r, 8, aw)
+            item_sched = self.table.item(r, 6)
+            if not item_sched:
+                self.table.setItem(r, 6, QTableWidgetItem(st))
+            else:
+                 if item_sched.text() != st:
+                     item_sched.setText(st)
+
+            # Errors
+            err_str = it.error or ""
+            item_err = self.table.item(r, 7)
+            if not item_err:
+                self.table.setItem(r, 7, QTableWidgetItem(err_str))
+            else:
+                if item_err.text() != err_str:
+                    item_err.setText(err_str)
+
+            # Actions
+            if not self.table.cellWidget(r, 8):
+                aw = QWidget(); ah = QHBoxLayout(); ah.setContentsMargins(0,0,0,0)
+                start_btn = QPushButton("Start"); pause_btn = QPushButton("Pause"); cancel_btn = QPushButton("Cancel")
+                ah.addWidget(start_btn); ah.addWidget(pause_btn); ah.addWidget(cancel_btn)
+                aw.setLayout(ah)
+                start_btn.clicked.connect(lambda _, iid=it.id: self.manager.resume_item(iid))
+                pause_btn.clicked.connect(lambda _, iid=it.id: self.manager.pause_item(iid))
+                cancel_btn.clicked.connect(lambda _, iid=it.id: self._cancel(iid))
+                self.table.setCellWidget(r, 8, aw)
 
     def _cancel(self, iid):
         it = self.manager.items.get(iid)
