@@ -144,7 +144,7 @@ class DB:
             await self._conn.execute("""
                 UPDATE downloads SET url=?, filename=?, dest_folder=?, segments=?, checksum_sha256=?,
                     scheduled_time=?, auth_username=?, auth_password=?, cookies_raw=?, proxy=?,
-                    max_bandwidth=?, retries=?, is_torrent=?, state=?, downloaded=?, total=? WHERE id=?
+                    max_bandwidth=?, retries=?, is_torrent=?, is_ytdlp=?, state=?, downloaded=?, total=? WHERE id=?
             """, (item.url, item.filename, item.dest_folder, item.segments, item.checksum_sha256,
                   item.scheduled_time.isoformat() if item.scheduled_time else None,
                   item.auth_username, item.auth_password, item.cookies_raw, item.proxy,
@@ -746,6 +746,7 @@ class MainWindow(QWidget):
         self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(["ID", "Name/URL", "Progress", "Speed", "State", "Total", "Scheduled", "Errors", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
         v.addWidget(self.table)
         sh = QHBoxLayout()
         sh.addWidget(QLabel("Global max concurrency:"))
