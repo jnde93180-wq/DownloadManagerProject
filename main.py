@@ -10,6 +10,8 @@ import importlib.util
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, List
+from urllib.parse import urlparse
+from pathlib import Path
 import aiosqlite
 import aiohttp
 from aiohttp import web, ClientTimeout, BasicAuth
@@ -47,6 +49,60 @@ HTTP_SERVER_PORT = 8765
 ffmpeg_path = os.path.join(os.path.dirname(__file__), "ffmpeg")
 if os.path.exists(ffmpeg_path):
     os.environ["PATH"] += os.pathsep + ffmpeg_path
+
+
+def is_valid_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if not p.scheme:
+        return False
+    scheme = p.scheme.lower()
+    return scheme in ("http", "https", "magnet")
+
+
+def merge_segment_files(dest: str, seg_paths: List[str], cleanup: bool = True):
+    # Ensure parent exists
+    parent = Path(dest).parent
+    parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as out_f:
+        for p in seg_paths:
+            with open(p, "rb") as sf:
+                while True:
+                    chunk = sf.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+    if cleanup:
+        try:
+            # remove segment files
+            for p in seg_paths:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+            # try to remove tmp dir if empty
+            tmp_dir = Path(seg_paths[0]).parent if seg_paths else None
+            if tmp_dir and tmp_dir.exists():
+                try:
+                    tmp_dir.rmdir()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def compute_range_start(start: Optional[int], outpath: str) -> Optional[int]:
+    if start is None:
+        return None
+    existing = 0
+    try:
+        if os.path.exists(outpath):
+            existing = os.path.getsize(outpath)
+    except Exception:
+        existing = 0
+    return start + existing
 
 @dataclass
 class DownloadItem:
@@ -234,6 +290,8 @@ class DownloadManager:
         self.global_max_concurrency = 3
         self.active_count = 0
         self.global_bucket = GlobalTokenBucket(loop, rate_bytes_per_sec=None, capacity=1_000_000)
+        # event hooks: event -> list[callable]
+        self._hooks: Dict[str, List] = {}
         if HAS_LIBTORRENT:
             self._init_libtorrent()
 
@@ -265,11 +323,19 @@ class DownloadManager:
             mod = importlib.util.module_from_spec(spec)
             try:
                 spec.loader.exec_module(mod)  # type: ignore
+                # Backwards compatible: plugins may expose a register(manager) function
                 if hasattr(mod, "register"):
                     try:
                         mod.register(self)
                     except Exception as e:
                         print("Plugin register error:", e)
+                # Or plugins may expose a `hooks` dict mapping event->callable
+                if hasattr(mod, "hooks") and isinstance(mod.hooks, dict):
+                    for ev, cb in mod.hooks.items():
+                        try:
+                            self.register_hook(ev, cb)
+                        except Exception as e:
+                            print("Plugin hook registration error:", e)
             except Exception as e:
                 print("Failed loading plugin", fname, e)
 
@@ -279,9 +345,19 @@ class DownloadManager:
             self.session = aiohttp.ClientSession(timeout=timeout)
 
     def add_item(self, item: DownloadItem):
+        # sanitize item paths and url
+        err = self._sanitize_item(item)
+        if err:
+            item.state = "failed"
+            item.error = err
+            self.ui_update(None)
+            return
+
         if item.id:
             self.items[item.id] = item
             self.loop.create_task(self.db.save_item(item))
+            # emit event
+            self._emit("on_item_added", item)
         else:
             self.loop.create_task(self._save_and_register(item))
 
@@ -294,7 +370,43 @@ class DownloadManager:
             item._pause_event.set()
             item._cancel_event = asyncio.Event()
             self.ui_update(item.id)
+            self._emit("on_item_added", item)
             await self.maybe_start_pending()
+
+    # Plugin/event API
+    def register_hook(self, event: str, callback):
+        self._hooks.setdefault(event, []).append(callback)
+
+    def _emit(self, event: str, item: Optional[DownloadItem] = None):
+        for cb in list(self._hooks.get(event, [])):
+            try:
+                cb(item)
+            except Exception as e:
+                print(f"Hook {event} error:", e)
+
+    # Security / validation helpers
+    def _sanitize_item(self, item: DownloadItem) -> Optional[str]:
+        # Validate URL
+        if not is_valid_url(item.url):
+            return "invalid url or unsupported scheme"
+        # Normalize destination folder
+        try:
+            dest = Path(item.dest_folder).expanduser().resolve()
+        except Exception:
+            return "invalid destination folder"
+        # Ensure dest exists or can be created
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return "cannot create destination folder"
+        item.dest_folder = str(dest)
+        # Prevent path traversal in filename
+        if item.filename:
+            fn = Path(item.filename).name
+            if fn != item.filename:
+                return "invalid filename"
+            item.filename = fn
+        return None
 
     def remove_item(self, item_id):
         it = self.items.get(item_id)
@@ -374,6 +486,7 @@ class DownloadManager:
         self.active_count += 1
         self.loop.create_task(self.db.save_item(it))
         self.ui_update(it.id)
+        self._emit("on_item_started", it)
 
     async def _download_with_retries(self, it: DownloadItem):
         attempt = 0
@@ -385,18 +498,22 @@ class DownloadManager:
                 it.progress = 100.0
                 await self.db.save_item(it)
                 self.ui_update(it.id)
+                self._emit("on_item_completed", it)
                 break
             except asyncio.CancelledError:
                 it.state = "cancelled"
                 it.error = "cancelled"
                 await self.db.save_item(it)
                 self.ui_update(it.id)
+                self._emit("on_item_cancelled", it)
                 break
             except Exception as e:
                 attempt += 1
                 it.error = f"attempt {attempt} failed: {e}"
                 await self.db.save_item(it)
                 self.ui_update(it.id)
+                # notify hooks about failure attempt
+                self._emit("on_item_failed", it)
                 if attempt > it.retries:
                     it.state = "failed"
                     await self.db.save_item(it)
@@ -442,22 +559,9 @@ class DownloadManager:
                 t = self.loop.create_task(self._download_range(it, s, e, p, auth))
                 seg_tasks.append(t)
             await asyncio.gather(*seg_tasks)
-            # merge
-            with open(dest, "wb") as out_f:
-                for _,_,p in segs:
-                    with open(p, "rb") as sf:
-                        while True:
-                            chunk = sf.read(4 * 1024 * 1024)
-                            if not chunk:
-                                break
-                            out_f.write(chunk)
-            # cleanup
-            try:
-                for _,_,p in segs:
-                    os.remove(p)
-                os.rmdir(tmp_dir)
-            except Exception:
-                pass
+            # merge segments into final file
+            seg_paths = [p for _,_,p in segs]
+            merge_segment_files(dest, seg_paths, cleanup=True)
         else:
             # single stream
             await self._download_range(it, 0, None, dest, auth, is_single=True)
@@ -521,9 +625,9 @@ class DownloadManager:
                         it.progress = min(100.0, (current / it.total) * 100.0)
                     else:
                         it.progress = 0.0
+                    # emit progress hooks
+                    self._emit("on_item_progress", it)
                     await self.db.save_item(it)
-                    self.ui_update(it.id)
-
                     self.ui_update(it.id)
 
     def _is_youtube(self, url: str) -> bool:
@@ -632,6 +736,13 @@ class DownloadManager:
         if state != "running":
             self.active_count = max(0, self.active_count - 1)
         self.ui_update(it.id)
+        # emit lifecycle events
+        if state == "completed":
+            self._emit("on_item_completed", it)
+        elif state == "cancelled":
+            self._emit("on_item_cancelled", it)
+        else:
+            self._emit("on_item_failed", it)
         await self.maybe_start_pending()
 
     # libtorrent integration (simplified)
@@ -773,6 +884,10 @@ class AddDialog(QDialog):
             return None
         url = self.url_edit.text().strip()
         if not url:
+            return None
+        # basic URL validation
+        if not is_valid_url(url):
+            QMessageBox.warning(self, "Invalid URL", "Please enter a valid http/https/magnet URL.")
             return None
         filename = self.filename_edit.text().strip() or os.path.basename(url.split("?",1)[0]) or f"dl_{int(datetime.now().timestamp())}"
         scheduled = self.schedule_dt.dateTime().toPython()

@@ -6,3 +6,5 @@ yarl>=1.9.2
 pyqtgraph>=0.13.5
 
 yt-dlp>=2023.7.6
+
+pytest>=7.0.0
