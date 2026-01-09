@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QDateTimeEdit, QCheckBox, QDialogButtonBox, QComboBox
 )
 from PySide6.QtCore import Qt, QTimer
+import sqlite3
 from PySide6.QtGui import QClipboard
 import pyqtgraph as pg
 try:
@@ -816,13 +817,13 @@ class AddDialog(QDialog):
         self.retries_spin = QSpinBox(); self.retries_spin.setRange(0, 20); self.retries_spin.setValue(3)
 
         self.quality_combo = QComboBox()
-        self.quality_combo.addItems(["Select Quality...", "Best", "1080p", "720p", "Audio Only"])
+        self.quality_combo.addItems(["Best", "1080p", "720p", "Audio Only"])
         
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["Select Format..."])
-        self.format_combo.setEnabled(False)
+        self.format_combo.addItems(["mp4", "mkv", "webm"])
 
         self.quality_combo.currentTextChanged.connect(self.on_quality_changed)
+        self.url_edit.textChanged.connect(self.on_url_changed)
         
         self.is_torrent_cb = QCheckBox("Is torrent / magnet")
         form.addRow("URL:", self.url_edit)
@@ -832,10 +833,16 @@ class AddDialog(QDialog):
         form.addRow("Segments:", self.segs_spin)
         form.addRow("Per-download bandwidth (KB/s, 0=none):", self.bandwidth_spin)
         form.addRow("Retries:", self.retries_spin)
-
-        form.addRow("Quality (Youtube):", self.quality_combo)
-        form.addRow("Format (Youtube):", self.format_combo)
         form.addRow("Checksum (SHA256):", self.checksum_edit)
+        
+        # YouTube/yt-dlp options (hidden by default)
+        self.youtube_label = QLabel("YouTube Options (auto-detected):")
+        self.youtube_label.setVisible(False)
+        form.addRow("", self.youtube_label)
+        self.quality_combo.setVisible(False)
+        self.format_combo.setVisible(False)
+        form.addRow("Quality (YouTube):", self.quality_combo)
+        form.addRow("Format (YouTube):", self.format_combo)
         form.addRow("Schedule:", self.schedule_dt)
         form.addRow("Auth username:", self.auth_user); form.addRow("Auth password:", self.auth_pass)
         form.addRow("Cookies (JSON or name=value lines):", self.cookies_text)
@@ -851,16 +858,18 @@ class AddDialog(QDialog):
         # Initial validation check
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(True) 
 
+    def on_url_changed(self, text):
+        # Show YouTube options only if URL contains YouTube domain
+        is_yt = "youtube.com" in text or "youtu.be" in text
+        self.youtube_label.setVisible(is_yt)
+        self.quality_combo.setVisible(is_yt)
+        self.format_combo.setVisible(is_yt)
+
     def on_quality_changed(self, text):
         self.format_combo.clear()
-        if text == "Select Quality...":
-            self.format_combo.addItem("Select Format...")
-            self.format_combo.setEnabled(False)
-        elif text == "Audio Only":
-            self.format_combo.setEnabled(True)
+        if text == "Audio Only":
             self.format_combo.addItems(["mp3", "m4a", "wav"])
         else: # Video
-            self.format_combo.setEnabled(True)
             self.format_combo.addItems(["mp4", "mkv", "webm"])
 
     def on_browse(self):
@@ -869,12 +878,13 @@ class AddDialog(QDialog):
             self.dest_edit.setText(folder)
 
     def accept(self):
-        # Validate inputs
-        if self.url_edit.text().strip() and ("youtube" in self.url_edit.text().strip() or "youtu.be" in self.url_edit.text().strip()):
-             if self.quality_combo.currentText() == "Select Quality...":
+        # Validate YouTube options if URL is YouTube
+        url_text = self.url_edit.text().strip()
+        if "youtube.com" in url_text or "youtu.be" in url_text:
+             if not self.quality_combo.currentText():
                  QMessageBox.warning(self, "Invalid Selection", "Please select a Quality.")
                  return
-             if self.format_combo.currentText() == "Select Format..." or not self.format_combo.currentText():
+             if not self.format_combo.currentText():
                  QMessageBox.warning(self, "Invalid Selection", "Please select a Format.")
                  return
         super().accept()
@@ -893,10 +903,18 @@ class AddDialog(QDialog):
         scheduled = self.schedule_dt.dateTime().toPython()
         bw = self.bandwidth_spin.value()
         
-        quality = self.quality_combo.currentText()
-        if quality == "Select Quality...": quality = "Best" # Fallback if validation bypassed (shouldn't happen)
-        file_fmt = self.format_combo.currentText()
-        if not file_fmt or file_fmt == "Select Format...": file_fmt = None
+        # Only include quality/format if URL is YouTube
+        quality = None
+        file_fmt = None
+        if "youtube.com" in url or "youtu.be" in url:
+            quality = self.quality_combo.currentText()
+            if not quality or quality == "Select Quality...": quality = "Best"
+            file_fmt = self.format_combo.currentText()
+            if not file_fmt or file_fmt == "Select Format...": file_fmt = None
+        else:
+            # For non-YouTube URLs, use sensible defaults
+            quality = "Best"
+            file_fmt = None
 
         return {
             "url": url,
@@ -916,6 +934,78 @@ class AddDialog(QDialog):
             "file_format": file_fmt,
             "is_torrent": self.is_torrent_cb.isChecked()
         }
+
+
+class HistoryDialog(QDialog):
+    def __init__(self, parent, db_path, manager):
+        super().__init__(parent)
+        self.setWindowTitle("Download History")
+        self.resize(800, 400)
+        self.manager = manager
+        self.db_path = db_path
+        v = QVBoxLayout(self)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["ID", "URL", "State", "Downloaded", "Total", "Error"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        v.addWidget(self.table)
+        h = QHBoxLayout()
+        self.delete_btn = QPushButton("Delete Selected")
+        self.close_btn = QPushButton("Close")
+        h.addWidget(self.delete_btn); h.addWidget(self.close_btn)
+        v.addLayout(h)
+        self.delete_btn.clicked.connect(self.on_delete)
+        self.close_btn.clicked.connect(self.accept)
+        self.load_history()
+
+    def load_history(self):
+        try:
+            con = sqlite3.connect(self.db_path)
+            cur = con.cursor()
+            # Check if 'error' column exists in the downloads table
+            cur.execute("PRAGMA table_info(downloads)")
+            cols = [r[1] for r in cur.fetchall()]
+            if 'error' in cols:
+                cur.execute("SELECT id, url, state, downloaded, total, error FROM downloads ORDER BY id DESC")
+            else:
+                # return empty string for error when column missing
+                cur.execute("SELECT id, url, state, downloaded, total, '' as error FROM downloads ORDER BY id DESC")
+            rows = cur.fetchall()
+            con.close()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to read DB: {e}")
+            rows = []
+        self.table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                it = QTableWidgetItem(str(val) if val is not None else "")
+                if c == 0:
+                    it.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(r, c, it)
+
+    def on_delete(self):
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            return
+        ids = [int(self.table.item(s.row(), 0).text()) for s in sel]
+        if QMessageBox.question(self, "Confirm", f"Delete {len(ids)} selected history rows? This cannot be undone.") != QMessageBox.Yes:
+            return
+        try:
+            con = sqlite3.connect(self.db_path)
+            cur = con.cursor()
+            for id_ in ids:
+                cur.execute("DELETE FROM downloads WHERE id=?", (id_,))
+                # remove from manager if present
+                if id_ in self.manager.items:
+                    try:
+                        del self.manager.items[id_]
+                    except Exception:
+                        pass
+            con.commit(); con.close()
+            # refresh caller UI
+            self.manager.ui_update(None)
+            self.load_history()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to delete rows: {e}")
 
 class DetailDialog(QDialog):
     def __init__(self, item: DownloadItem, parent=None):
@@ -952,10 +1042,16 @@ class MainWindow(QWidget):
         self.settings_btn = QPushButton("Settings")
         h.addWidget(self.add_btn); h.addWidget(self.start_all_btn); h.addWidget(self.pause_all_btn); h.addWidget(self.settings_btn)
         v.addLayout(h)
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(["ID", "Name/URL", "Progress", "Speed", "State", "Total", "Scheduled", "Errors", "Actions"])
+        # Columns: ID, Name/URL, Progress, Speed, Time Left, State, Size, Scheduled, Errors, Actions
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(["ID", "Name/URL", "Progress", "Speed", "Time Left", "State", "Size", "Scheduled", "Errors", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        # Keep actions column fixed so buttons don't get squashed
+        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Fixed)
+        self.table.setColumnWidth(9, 220)
+        # Make ID column compact
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 48)
         v.addWidget(self.table)
         sh = QHBoxLayout()
         sh.addWidget(QLabel("Global max concurrency:"))
@@ -970,7 +1066,9 @@ class MainWindow(QWidget):
         self.add_btn.clicked.connect(self.on_add)
         self.start_all_btn.clicked.connect(lambda: self.manager.start_all())
         self.pause_all_btn.clicked.connect(self.on_pause_all)
-        self.settings_btn.clicked.connect(self.on_settings)
+        # Replace Settings with History
+        self.settings_btn.setText("History")
+        self.settings_btn.clicked.connect(self.on_history)
         self.table.cellDoubleClicked.connect(self.on_double_click)
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh_ui)
@@ -979,6 +1077,15 @@ class MainWindow(QWidget):
         self.clipboard.dataChanged.connect(self.on_clipboard_change)
         self.loop.create_task(self.manager.init())
         self.loop.create_task(self.start_http_server())
+
+    def on_toggle_pause(self, iid: int):
+        it = self.manager.items.get(iid)
+        if not it:
+            return
+        if it.state == 'running':
+            self.manager.pause_item(iid)
+        else:
+            self.manager.resume_item(iid)
 
     async def start_http_server(self):
         app = web.Application()
@@ -1051,6 +1158,10 @@ class MainWindow(QWidget):
         dlg = DetailDialog(it, self)
         dlg.exec()
 
+    def on_history(self):
+        dlg = HistoryDialog(self, self.manager.db.path, self.manager)
+        dlg.exec()
+
     def on_clipboard_change(self):
         txt = self.clipboard.text()
         if not txt:
@@ -1076,6 +1187,7 @@ class MainWindow(QWidget):
             item_id = self.table.item(r, 0)
             if not item_id:
                 item_id = QTableWidgetItem(str(it.id))
+                item_id.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(r, 0, item_id)
             else:
                 if item_id.text() != str(it.id):
@@ -1094,11 +1206,13 @@ class MainWindow(QWidget):
             prog = self.table.cellWidget(r, 2)
             if not prog:
                 prog = QProgressBar()
+                prog.setTextVisible(True)
                 self.table.setCellWidget(r, 2, prog)
             prog.setValue(int(it.progress or 0))
 
-            # Speed
-            speed_str = f"{it.speed/1024:.1f} KB/s" if it.speed else ""
+            # Speed (always show, if unknown show 0.0 KB/s)
+            speed_val = it.speed or 0.0
+            speed_str = f"{speed_val/1024:.1f} KB/s"
             item_speed = self.table.item(r, 3)
             if not item_speed:
                 self.table.setItem(r, 3, QTableWidgetItem(speed_str))
@@ -1106,51 +1220,94 @@ class MainWindow(QWidget):
                 if item_speed.text() != speed_str:
                     item_speed.setText(speed_str)
 
+            # Time Left
+            tl_str = ""
+            try:
+                if it.total and it.downloaded and it.speed and it.speed > 0:
+                    rem = max(0, it.total - it.downloaded)
+                    secs = int(rem / it.speed)
+                    hrs = secs // 3600; mins = (secs % 3600) // 60; s = secs % 60
+                    tl_str = f"{hrs:02d}:{mins:02d}:{s:02d}"
+            except Exception:
+                tl_str = ""
+            item_tl = self.table.item(r, 4)
+            if not item_tl:
+                self.table.setItem(r, 4, QTableWidgetItem(tl_str))
+            else:
+                if item_tl.text() != tl_str:
+                    item_tl.setText(tl_str)
+
             # State
-            item_state = self.table.item(r, 4)
+            item_state = self.table.item(r, 5)
             if not item_state:
-                self.table.setItem(r, 4, QTableWidgetItem(it.state))
+                self.table.setItem(r, 5, QTableWidgetItem(it.state))
             else:
                 if item_state.text() != it.state:
                    item_state.setText(it.state)
 
-            # Total
-            total_str = str(it.total) if it.total else ""
-            item_total = self.table.item(r, 5)
-            if not item_total:
-                self.table.setItem(r, 5, QTableWidgetItem(total_str))
+            # Size (human readable)
+            def hr(n):
+                if not n:
+                    return ""
+                for u in ['B','KB','MB','GB','TB']:
+                    if n < 1024.0:
+                        return f"{n:3.1f} {u}"
+                    n /= 1024.0
+                return f"{n:.1f} PB"
+
+            size_str = hr(it.total) if it.total else ""
+            item_size = self.table.item(r, 6)
+            if not item_size:
+                self.table.setItem(r, 6, QTableWidgetItem(size_str))
             else:
-                if item_total.text() != total_str:
-                    item_total.setText(total_str)
+                if item_size.text() != size_str:
+                    item_size.setText(size_str)
 
             # Scheduled
             st = it.scheduled_time.strftime("%Y-%m-%d %H:%M:%S") if it.scheduled_time else ""
-            item_sched = self.table.item(r, 6)
+            item_sched = self.table.item(r, 7)
             if not item_sched:
-                self.table.setItem(r, 6, QTableWidgetItem(st))
+                self.table.setItem(r, 7, QTableWidgetItem(st))
             else:
                  if item_sched.text() != st:
                      item_sched.setText(st)
 
             # Errors
             err_str = it.error or ""
-            item_err = self.table.item(r, 7)
+            item_err = self.table.item(r, 8)
             if not item_err:
-                self.table.setItem(r, 7, QTableWidgetItem(err_str))
+                self.table.setItem(r, 8, QTableWidgetItem(err_str))
             else:
                 if item_err.text() != err_str:
                     item_err.setText(err_str)
 
-            # Actions
-            if not self.table.cellWidget(r, 8):
-                aw = QWidget(); ah = QHBoxLayout(); ah.setContentsMargins(0,0,0,0)
-                start_btn = QPushButton("Start"); pause_btn = QPushButton("Pause"); cancel_btn = QPushButton("Cancel")
-                ah.addWidget(start_btn); ah.addWidget(pause_btn); ah.addWidget(cancel_btn)
-                aw.setLayout(ah)
-                start_btn.clicked.connect(lambda _, iid=it.id: self.manager.resume_item(iid))
-                pause_btn.clicked.connect(lambda _, iid=it.id: self.manager.pause_item(iid))
-                cancel_btn.clicked.connect(lambda _, iid=it.id: self._cancel(iid))
-                self.table.setCellWidget(r, 8, aw)
+            # Actions - recreate each time to ensure proper state and signals
+            aw = QWidget(); ah = QHBoxLayout(); ah.setContentsMargins(4,4,4,4); ah.setSpacing(6)
+            ah.setAlignment(Qt.AlignCenter)
+            start_btn = QPushButton("Start"); pause_btn = QPushButton("Pause"); cancel_btn = QPushButton("Cancel")
+            # button sizing for consistent appearance and per-button hover style
+            for b in (start_btn, pause_btn, cancel_btn):
+                b.setFixedHeight(24); b.setFixedWidth(60)
+                b.setStyleSheet('QPushButton{background:transparent;border:1px solid rgba(255,255,255,0.06);border-radius:4px;padding:2px 6px;} QPushButton:hover{background: rgba(255,255,255,0.06);}')
+            ah.addWidget(start_btn); ah.addWidget(pause_btn); ah.addWidget(cancel_btn)
+            aw.setLayout(ah)
+            # connect using partial to bind id
+            from functools import partial
+            start_btn.clicked.connect(partial(self.manager.resume_item, it.id))
+            # Toggle pause/resume depending on current state
+            pause_btn.clicked.connect(partial(self.on_toggle_pause, it.id))
+            cancel_btn.clicked.connect(partial(self._cancel, it.id))
+            # adjust visibility according to state
+            if it.state == 'running':
+                start_btn.setEnabled(False)
+                pause_btn.setText('Pause')
+            elif it.state == 'paused':
+                start_btn.setEnabled(True)
+                pause_btn.setText('Resume')
+            else:
+                start_btn.setEnabled(True)
+                pause_btn.setText('Pause')
+            self.table.setCellWidget(r, 9, aw)
 
     def _cancel(self, iid):
         it = self.manager.items.get(iid)
