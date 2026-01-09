@@ -1181,6 +1181,9 @@ class MainWindow(QWidget):
 
     def refresh_ui(self):
         items = list(self.manager.items.values())
+        # Show only the last 10 downloads on the main page
+        max_shown = 10
+        items = items[-max_shown:] if len(items) > max_shown else items
         self.table.setRowCount(len(items))
         for r, it in enumerate(items):
             # ID
