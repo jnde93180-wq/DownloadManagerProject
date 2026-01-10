@@ -4,6 +4,7 @@ This is the main runnable GUI program. See README.md for usage.
 """
 import sys
 import os
+import time
 import asyncio
 import hashlib
 import importlib.util
@@ -126,6 +127,9 @@ class DownloadItem:
     is_torrent: bool = False
     is_ytdlp: bool = False
 
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+
     state: str = "queued"
     downloaded: int = 0
     total: Optional[int] = None
@@ -198,7 +202,8 @@ class DB:
                 checksum_sha256 TEXT, scheduled_time TEXT, auth_username TEXT,
                 auth_password TEXT, cookies_raw TEXT, proxy TEXT,
                 max_bandwidth INTEGER, retries INTEGER, is_torrent INTEGER, is_ytdlp INTEGER,
-                state TEXT, downloaded INTEGER, total INTEGER, quality TEXT, file_format TEXT
+                state TEXT, downloaded INTEGER, total INTEGER, quality TEXT, file_format TEXT,
+                start_time REAL, end_time REAL
             )
         """)
         try:
@@ -209,6 +214,14 @@ class DB:
             await self._conn.execute("ALTER TABLE downloads ADD COLUMN file_format TEXT")
         except Exception:
             pass
+        try:
+            await self._conn.execute("ALTER TABLE downloads ADD COLUMN start_time REAL")
+        except Exception:
+            pass
+        try:
+            await self._conn.execute("ALTER TABLE downloads ADD COLUMN end_time REAL")
+        except Exception:
+            pass
         await self._conn.commit()
 
     async def save_item(self, item: DownloadItem):
@@ -216,24 +229,27 @@ class DB:
             await self._conn.execute("""
                 UPDATE downloads SET url=?, filename=?, dest_folder=?, segments=?, checksum_sha256=?,
                     scheduled_time=?, auth_username=?, auth_password=?, cookies_raw=?, proxy=?,
-                    max_bandwidth=?, retries=?, is_torrent=?, is_ytdlp=?, state=?, downloaded=?, total=?, quality=?, file_format=? WHERE id=?
+                    max_bandwidth=?, retries=?, is_torrent=?, is_ytdlp=?, state=?, downloaded=?, total=?, quality=?, file_format=?,
+                    start_time=?, end_time=? WHERE id=?
             """, (item.url, item.filename, item.dest_folder, item.segments, item.checksum_sha256,
                   item.scheduled_time.isoformat() if item.scheduled_time else None,
                   item.auth_username, item.auth_password, item.cookies_raw, item.proxy,
                   item.max_bandwidth, item.retries, int(item.is_torrent), int(item.is_ytdlp),
-                  item.state, item.downloaded, item.total, item.quality, item.file_format, item.id))
+                  item.state, item.downloaded, item.total, item.quality, item.file_format,
+                  item.start_time, item.end_time, item.id))
             await self._conn.commit()
         else:
             cur = await self._conn.execute("""
                 INSERT INTO downloads (url, filename, dest_folder, segments, checksum_sha256,
                     scheduled_time, auth_username, auth_password, cookies_raw, proxy,
-                    max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total, quality, file_format)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total, quality, file_format, start_time, end_time)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (item.url, item.filename, item.dest_folder, item.segments, item.checksum_sha256,
                   item.scheduled_time.isoformat() if item.scheduled_time else None,
                   item.auth_username, item.auth_password, item.cookies_raw, item.proxy,
                   item.max_bandwidth, item.retries, int(item.is_torrent), int(item.is_ytdlp),
-                  item.state, item.downloaded, item.total, item.quality, item.file_format))
+                  item.state, item.downloaded, item.total, item.quality, item.file_format,
+                  item.start_time, item.end_time))
             await self._conn.commit()
             item.id = cur.lastrowid
 
@@ -247,10 +263,31 @@ class DB:
         rows = await cur.fetchall()
         items = []
         for r in rows:
-            (id_, url, filename, dest_folder, segments, checksum_sha256,
-             scheduled_time, auth_username, auth_password, cookies_raw,
+            # Flexible unpacking
+            id_ = r[0]
+            url = r[1]
+            filename = r[2]
+            dest_folder = r[3]
+            segments = r[4]
+            checksum_sha256 = r[5]
+            scheduled_time = r[6]
+            auth_username = r[7]
+            auth_password = r[8]
+            cookies_raw = r[9]
+            proxy = r[10]
+            max_bandwidth = r[11]
+            retries = r[12]
+            is_torrent = r[13]
+            is_ytdlp = r[14]
+            state = r[15]
+            downloaded = r[16]
+            total = r[17]
+            quality = r[18]
+            file_format = r[19]
+            
+            start_time = r[20] if len(r) > 20 else None
+            end_time = r[21] if len(r) > 21 else None
 
-             proxy, max_bandwidth, retries, is_torrent, is_ytdlp, state, downloaded, total, quality, file_format) = r
             item = DownloadItem(
                 id=id_,
                 url=url,
@@ -271,7 +308,9 @@ class DB:
                 downloaded=downloaded or 0,
                 total=total,
                 quality=quality or "Best",
-                file_format=file_format
+                file_format=file_format,
+                start_time=start_time,
+                end_time=end_time
             )
             item._pause_event = asyncio.Event()
             if item.state != "paused":
@@ -479,6 +518,7 @@ class DownloadManager:
         if it._task and not it._task.done():
             return
         it.state = "running"
+        it.start_time = time.time()
         it.error = None
         it._cancel_event = asyncio.Event()
         it._pause_event = asyncio.Event()
@@ -497,6 +537,7 @@ class DownloadManager:
                 await self._download_http(it)
                 it.state = "completed"
                 it.progress = 100.0
+                it.end_time = time.time()
                 await self.db.save_item(it)
                 self.ui_update(it.id)
                 self._emit("on_item_completed", it)
@@ -644,6 +685,7 @@ class DownloadManager:
         if it._task and not it._task.done():
             return
         it.state = "running"
+        it.start_time = time.time()
         it.error = None
         it._cancel_event = asyncio.Event()
         it._pause_event = asyncio.Event()
@@ -731,6 +773,25 @@ class DownloadManager:
 
     async def _finalize_ytdlp(self, it: DownloadItem, state, error=None):
         it.state = state
+        if state == "completed":
+            it.end_time = time.time()
+            # Try to find the actual downloaded filename
+            try:
+                if os.path.exists(it.dest_folder):
+                    # Look for recently created files in the destination folder
+                    files = [f for f in os.listdir(it.dest_folder) if os.path.isfile(os.path.join(it.dest_folder, f))]
+                    if files:
+                        # Get the most recently modified file
+                        files.sort(key=lambda x: os.path.getmtime(os.path.join(it.dest_folder, x)), reverse=True)
+                        # Check if it's a reasonable file (not too old, not a temp file)
+                        for file in files:
+                            file_path = os.path.join(it.dest_folder, file)
+                            file_age = time.time() - os.path.getmtime(file_path)
+                            if file_age < 300 and not file.startswith('.'):  # Less than 5 minutes old and not hidden
+                                it.filename = file
+                                break
+            except Exception:
+                pass  # If we can't determine the filename, leave it as is
         if error:
             it.error = error
         await self.db.save_item(it)
@@ -768,6 +829,7 @@ class DownloadManager:
             params.save_path = it.dest_folder
         handle = self.torrent_session.add_torrent(params)
         it.state = "running"
+        it.start_time = time.time()
         it._task = self.loop.create_task(self._monitor_torrent(it, handle))
         self.active_count += 1
         self.loop.create_task(self.db.save_item(it))
@@ -785,6 +847,7 @@ class DownloadManager:
                 self.ui_update(it.id)
                 await asyncio.sleep(1.0)
             it.state = "completed"
+            it.end_time = time.time()
             await self.db.save_item(it)
             self.ui_update(it.id)
         except asyncio.CancelledError:
@@ -797,12 +860,14 @@ class DownloadManager:
 
 # UI
 class AddDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_url=None):
         super().__init__(parent)
         self.setWindowTitle("Add Download")
         self.layout = QVBoxLayout(self)
         form = QFormLayout()
         self.url_edit = QLineEdit()
+        if initial_url:
+            self.url_edit.setText(initial_url)
         self.filename_edit = QLineEdit()
         self.dest_edit = QLineEdit(os.path.expanduser("~\\Downloads"))
         self.browse_btn = QPushButton("Browse")
@@ -817,7 +882,7 @@ class AddDialog(QDialog):
         self.retries_spin = QSpinBox(); self.retries_spin.setRange(0, 20); self.retries_spin.setValue(3)
 
         self.quality_combo = QComboBox()
-        self.quality_combo.addItems(["Best", "1080p", "720p", "Audio Only"])
+        self.quality_combo.addItems(["Best", "1080p", "720p", "360p", "Audio Only"])
         
         self.format_combo = QComboBox()
         self.format_combo.addItems(["mp4", "mkv", "webm"])
@@ -861,16 +926,42 @@ class AddDialog(QDialog):
     def on_url_changed(self, text):
         # Show YouTube options only if URL contains YouTube domain
         is_yt = "youtube.com" in text or "youtu.be" in text
-        self.youtube_label.setVisible(is_yt)
-        self.quality_combo.setVisible(is_yt)
-        self.format_combo.setVisible(is_yt)
+        is_img = any(text.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp'])
+        is_audio = any(text.lower().endswith(ext) for ext in ['.mp3', '.wav', '.flac', '.m4a'])
+        
+        # Show options based on type
+        self.youtube_label.setVisible(is_yt or is_img or is_audio)
+        self.quality_combo.setVisible(is_yt or is_img or is_audio)
+        self.format_combo.setVisible(is_yt or is_img or is_audio)
+        
+        if is_yt:
+             self.youtube_label.setText("YouTube Options:")
+             self.quality_combo.clear()
+             self.quality_combo.addItems(["Best", "1080p", "720p", "360p", "Audio Only"])
+             self.format_combo.clear()
+             self.format_combo.addItems(["mp4", "mkv", "webm"])
+        elif is_img:
+             self.youtube_label.setText("Image Options:")
+             self.quality_combo.clear()
+             self.quality_combo.addItems(["Original", "High", "Medium", "Low"])
+             self.format_combo.clear()
+             self.format_combo.addItems(["jpg", "png", "webp"])
+        elif is_audio:
+             self.youtube_label.setText("Audio Options:")
+             self.quality_combo.clear()
+             self.quality_combo.addItems(["Original", "High (320k)", "Medium (192k)", "Low (128k)"])
+             self.format_combo.clear()
+             self.format_combo.addItems(["mp3", "wav", "m4a", "flac"])
 
     def on_quality_changed(self, text):
-        self.format_combo.clear()
-        if text == "Audio Only":
-            self.format_combo.addItems(["mp3", "m4a", "wav"])
-        else: # Video
-            self.format_combo.addItems(["mp4", "mkv", "webm"])
+        # Only update format combo for YouTube "Audio Only" switch, preserve others
+        url_text = self.url_edit.text()
+        if "youtube.com" in url_text or "youtu.be" in url_text:
+            self.format_combo.clear()
+            if text == "Audio Only":
+                self.format_combo.addItems(["mp3", "m4a", "wav"])
+            else: # Video
+                self.format_combo.addItems(["mp4", "mkv", "webm"])
 
     def on_browse(self):
         folder = QFileDialog.getExistingDirectory(self, "Select destination folder", self.dest_edit.text())
@@ -1028,6 +1119,103 @@ class DetailDialog(QDialog):
         y = [v/1024.0 for v in data]
         self.plot.setData(y)
 
+class DownloadCompleteDialog(QDialog):
+    def __init__(self, item: DownloadItem, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Download Finished")
+        self.resize(400, 200)
+        self.layout = QVBoxLayout(self)
+        
+        lbl = QLabel(f"Download finished:\n{item.filename}")
+        lbl.setWordWrap(True)
+        lbl.setAlignment(Qt.AlignCenter)
+        font = lbl.font()
+        font.setBold(True)
+        lbl.setFont(font)
+        self.layout.addWidget(lbl)
+        
+        # Calculate time
+        duration_str = "Unknown"
+        if item.start_time and item.end_time:
+            diff = item.end_time - item.start_time
+            if diff < 60:
+                duration_str = f"{diff:.1f} seconds"
+            else:
+                mins = int(diff / 60)
+                secs = int(diff % 60)
+                duration_str = f"{mins}m {secs}s"
+        
+        # Size
+        size_str = "Unknown"
+        if item.total:
+            if item.total < 1024 * 1024:
+                size_str = f"{item.total / 1024:.1f} KB"
+            elif item.total < 1024 * 1024 * 1024:
+                size_str = f"{item.total / (1024*1024):.1f} MB"
+            else:
+                size_str = f"{item.total / (1024*1024*1024):.2f} GB"
+        
+        form = QFormLayout()
+        form.addRow("Time taken:", QLabel(duration_str))
+        form.addRow("Size:", QLabel(size_str))
+        
+        # Add location display
+        location_str = os.path.join(self.item.dest_folder, self.item.filename) if self.item.filename else self.item.dest_folder
+        location_lbl = QLabel(location_str)
+        location_lbl.setWordWrap(True)
+        location_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("Location:", location_lbl)
+        
+        self.layout.addLayout(form)
+        
+        h = QHBoxLayout()
+        self.open_btn = QPushButton("Open File")
+        self.finish_btn = QPushButton("Finish")
+        h.addWidget(self.open_btn)
+        h.addWidget(self.finish_btn)
+        self.layout.addLayout(h)
+        
+        self.open_btn.clicked.connect(self.on_open)
+        self.finish_btn.clicked.connect(self.accept)
+        
+        self.item = item
+
+    def on_open(self):
+        try:
+            # Try to find the actual downloaded file
+            path = None
+            
+            # First try the stored filename
+            if self.item.filename:
+                test_path = os.path.join(self.item.dest_folder, self.item.filename)
+                if os.path.exists(test_path):
+                    path = test_path
+            
+            # If that doesn't work, try to find any file with a matching base name
+            if not path and self.item.filename:
+                base_name = os.path.splitext(self.item.filename)[0]
+                if os.path.exists(self.item.dest_folder):
+                    for file in os.listdir(self.item.dest_folder):
+                        if file.startswith(base_name):
+                            path = os.path.join(self.item.dest_folder, file)
+                            break
+            
+            # If still no path, try to find any recent file in the destination folder
+            if not path and os.path.exists(self.item.dest_folder):
+                files = [f for f in os.listdir(self.item.dest_folder) if os.path.isfile(os.path.join(self.item.dest_folder, f))]
+                if files:
+                    # Get the most recently modified file
+                    files.sort(key=lambda x: os.path.getmtime(os.path.join(self.item.dest_folder, x)), reverse=True)
+                    path = os.path.join(self.item.dest_folder, files[0])
+            
+            if path and os.path.exists(path):
+                os.startfile(path)
+            else:
+                QMessageBox.warning(self, "Error", f"Could not find downloaded file in:\n{self.item.dest_folder}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open file: {e}")
+        self.accept()
+
 class MainWindow(QWidget):
     def __init__(self, loop):
         super().__init__()
@@ -1063,6 +1251,7 @@ class MainWindow(QWidget):
         v.addLayout(sh)
         self.setLayout(v)
         self.manager = DownloadManager(self.loop, self.ui_update)
+        self.manager.register_hook("on_item_completed", self.on_download_completed)
         self.add_btn.clicked.connect(self.on_add)
         self.start_all_btn.clicked.connect(lambda: self.manager.start_all())
         self.pause_all_btn.clicked.connect(self.on_pause_all)
@@ -1086,6 +1275,14 @@ class MainWindow(QWidget):
             self.manager.pause_item(iid)
         else:
             self.manager.resume_item(iid)
+
+    def on_download_completed(self, item: DownloadItem):
+        # Schedule dialog to show later so we don't block the download manager loop
+        QTimer.singleShot(100, lambda: self._show_complete_dialog(item))
+
+    def _show_complete_dialog(self, item: DownloadItem):
+        dlg = DownloadCompleteDialog(item, self)
+        dlg.exec()
 
     async def start_http_server(self):
         app = web.Application()
@@ -1113,8 +1310,8 @@ class MainWindow(QWidget):
         await site.start()
         print(f"HTTP extension endpoint available on http://127.0.0.1:{HTTP_SERVER_PORT}/add")
 
-    def on_add(self):
-        dlg = AddDialog(self)
+    def on_add(self, initial_url=None):
+        dlg = AddDialog(self, initial_url)
         data = dlg.get_data()
         if not data:
             return
@@ -1168,13 +1365,7 @@ class MainWindow(QWidget):
             return
         if txt.startswith("http://") or txt.startswith("https://") or txt.startswith("magnet:") or txt.endswith(".torrent"):
             if QMessageBox.question(self, "URL detected", f"Add URL?\n{txt}") == QMessageBox.Yes:
-                item = DownloadItem(
-                    url=txt,
-                    filename=os.path.basename(txt.split("?",1)[0]) or f"dl_{int(datetime.now().timestamp())}",
-                    dest_folder=os.path.expanduser("~\\Downloads"),
-                    segments=DEFAULT_SEGMENTS
-                )
-                self.manager.add_item(item)
+                self.on_add(initial_url=txt)
 
     def ui_update(self, item_id: Optional[int]):
         self.refresh_ui()

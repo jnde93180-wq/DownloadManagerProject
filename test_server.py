@@ -1,4 +1,4 @@
-﻿"""
+"""
 Simple test HTTP server that streams a large pseudo-file for testing downloads.
 
 Run:
@@ -30,13 +30,18 @@ async def large_handler(request):
     }
     return web.Response(body=stream, headers=headers)
 
+async def index_handler(request):
+    return web.Response(text="Test Server Running. Use /large to test download.", content_type="text/plain")
+
 async def init_app():
     app = web.Application()
+    app.router.add_get("/", index_handler)
     app.router.add_get("/large", large_handler)
     return app
 
 def main():
     app = web.Application()
+    app.router.add_get("/", index_handler)
     app.router.add_get("/large", large_handler)
     web.run_app(app, host="127.0.0.1", port=8080)
 
