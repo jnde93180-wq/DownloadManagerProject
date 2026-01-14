@@ -1376,13 +1376,11 @@ class MainWindow(QWidget):
         self.settings_btn = QPushButton("Settings")
         h.addWidget(self.add_btn); h.addWidget(self.start_all_btn); h.addWidget(self.pause_all_btn); h.addWidget(self.settings_btn)
         v.addLayout(h)
-        # Columns: ID, Name/URL, Progress, Speed, Time Left, State, Size, Scheduled, Errors, Actions
-        self.table = QTableWidget(0, 10)
-        self.table.setHorizontalHeaderLabels(["ID", "Name/URL", "Progress", "Speed", "Time Left", "State", "Size", "Scheduled", "Errors", "Actions"])
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(["ID", "Name/URL", "Progress", "Speed", "Time Left", "State", "Size", "Scheduled", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        # Keep actions column fixed so buttons don't get squashed
-        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Fixed)
-        self.table.setColumnWidth(9, 220)
+        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Fixed)
+        self.table.setColumnWidth(8, 260)
         # Make ID column compact
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.table.setColumnWidth(0, 48)
@@ -1608,7 +1606,6 @@ class MainWindow(QWidget):
                 if item_size.text() != size_str:
                     item_size.setText(size_str)
 
-            # Scheduled
             st = it.scheduled_time.strftime("%Y-%m-%d %H:%M:%S") if it.scheduled_time else ""
             item_sched = self.table.item(r, 7)
             if not item_sched:
@@ -1617,35 +1614,20 @@ class MainWindow(QWidget):
                  if item_sched.text() != st:
                      item_sched.setText(st)
 
-            # Errors
-            err_str = it.error or ""
-            item_err = self.table.item(r, 8)
-
-
-
-            if not item_err:
-                self.table.setItem(r, 8, QTableWidgetItem(err_str))
-            else:
-                if item_err.text() != err_str:
-                    item_err.setText(err_str)
-
             # Actions - recreate each time to ensure proper state and signals
             aw = QWidget(); ah = QHBoxLayout(); ah.setContentsMargins(4,4,4,4); ah.setSpacing(6)
             ah.setAlignment(Qt.AlignCenter)
-            start_btn = QPushButton("Start"); pause_btn = QPushButton("Pause"); cancel_btn = QPushButton("Cancel")
-            # button sizing for consistent appearance and per-button hover style
-            for b in (start_btn, pause_btn, cancel_btn):
+            start_btn = QPushButton("Start"); pause_btn = QPushButton("Pause"); cancel_btn = QPushButton("Cancel"); open_btn = QPushButton("Open")
+            for b in (start_btn, pause_btn, cancel_btn, open_btn):
                 b.setFixedHeight(24); b.setFixedWidth(60)
                 b.setStyleSheet('QPushButton{background:transparent;border:1px solid rgba(255,255,255,0.06);border-radius:4px;padding:2px 6px;} QPushButton:hover{background: rgba(255,255,255,0.06);}')
-            ah.addWidget(start_btn); ah.addWidget(pause_btn); ah.addWidget(cancel_btn)
+            ah.addWidget(start_btn); ah.addWidget(pause_btn); ah.addWidget(cancel_btn); ah.addWidget(open_btn)
             aw.setLayout(ah)
-            # connect using partial to bind id
             from functools import partial
             start_btn.clicked.connect(partial(self.manager.resume_item, it.id))
-            # Toggle pause/resume depending on current state
             pause_btn.clicked.connect(partial(self.on_toggle_pause, it.id))
             cancel_btn.clicked.connect(partial(self._cancel, it.id))
-            # adjust visibility according to state
+            open_btn.clicked.connect(partial(self._open_item_file, it.id))
             if it.state == 'running':
                 start_btn.setEnabled(False)
                 pause_btn.setText('Pause')
@@ -1655,7 +1637,36 @@ class MainWindow(QWidget):
             else:
                 start_btn.setEnabled(True)
                 pause_btn.setText('Pause')
-            self.table.setCellWidget(r, 9, aw)
+            self.table.setCellWidget(r, 8, aw)
+
+    def _open_item_file(self, iid):
+        it = self.manager.items.get(iid)
+        if not it:
+            return
+        path = None
+        if it.filename:
+            test_path = os.path.join(it.dest_folder, it.filename)
+            if os.path.exists(test_path):
+                path = test_path
+        if not path and it.filename:
+            base_name = os.path.splitext(it.filename)[0]
+            if os.path.exists(it.dest_folder):
+                for file in os.listdir(it.dest_folder):
+                    if file.startswith(base_name):
+                        path = os.path.join(it.dest_folder, file)
+                        break
+        if not path and os.path.exists(it.dest_folder):
+            files = [f for f in os.listdir(it.dest_folder) if os.path.isfile(os.path.join(it.dest_folder, f))]
+            if files:
+                files.sort(key=lambda x: os.path.getmtime(os.path.join(it.dest_folder, x)), reverse=True)
+                path = os.path.join(it.dest_folder, files[0])
+        if path and os.path.exists(path):
+            try:
+                os.startfile(path)
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not open file: {e}")
+        else:
+            QMessageBox.warning(self, "Error", f"Could not find downloaded file in:\n{it.dest_folder}")
 
     def _cancel(self, iid):
         it = self.manager.items.get(iid)
