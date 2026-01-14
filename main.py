@@ -27,6 +27,13 @@ from PySide6.QtCore import Qt, QTimer
 import sqlite3
 from PySide6.QtGui import QClipboard
 import pyqtgraph as pg
+import shutil
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    Image = None
+    HAS_PIL = False
 try:
     import yt_dlp
     HAS_YTDLP = True
@@ -500,7 +507,12 @@ class DownloadManager:
             if it.state == "queued":
                 if it.scheduled_time and it.scheduled_time > datetime.now():
                     continue
+                use_ytdlp = False
                 if self._is_youtube(it.url) or it.is_ytdlp:
+                    use_ytdlp = True
+                elif HAS_YTDLP and (it.quality or it.file_format):
+                    use_ytdlp = True
+                if use_ytdlp:
                     it.is_ytdlp = True
                     self._launch_ytdlp(it)
                 elif it.is_torrent:
@@ -535,6 +547,7 @@ class DownloadManager:
         while attempt <= it.retries:
             try:
                 await self._download_http(it)
+                await self._post_process_media(it)
                 it.state = "completed"
                 it.progress = 100.0
                 it.end_time = time.time()
@@ -675,6 +688,9 @@ class DownloadManager:
     def _is_youtube(self, url: str) -> bool:
         return "youtube.com" in url or "youtu.be" in url
 
+    def has_ffmpeg(self):
+        return shutil.which("ffmpeg") is not None
+
     def _launch_ytdlp(self, it: DownloadItem):
         if not HAS_YTDLP:
             it.state = "failed"
@@ -733,7 +749,10 @@ class DownloadManager:
 
         # Select format
         format_sel = 'bestvideo+bestaudio/best'
-        if it.quality == '1080p':
+        if not self.has_ffmpeg():
+            # Force single file download if no ffmpeg to avoid merge failure
+            format_sel = 'best'
+        elif it.quality == '1080p':
             format_sel = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
         elif it.quality == '720p':
             format_sel = 'bestvideo[height<=720]+bestaudio/best[height<=720]'
@@ -749,7 +768,7 @@ class DownloadManager:
         }
 
         # Conversion logic
-        if it.file_format:
+        if it.file_format and self.has_ffmpeg():
             if it.quality == 'Audio Only':
                 ydl_opts['postprocessors'] = [{
                     'key': 'FFmpegExtractAudio',
@@ -775,23 +794,24 @@ class DownloadManager:
         it.state = state
         if state == "completed":
             it.end_time = time.time()
-            # Try to find the actual downloaded filename
             try:
                 if os.path.exists(it.dest_folder):
-                    # Look for recently created files in the destination folder
                     files = [f for f in os.listdir(it.dest_folder) if os.path.isfile(os.path.join(it.dest_folder, f))]
                     if files:
-                        # Get the most recently modified file
                         files.sort(key=lambda x: os.path.getmtime(os.path.join(it.dest_folder, x)), reverse=True)
-                        # Check if it's a reasonable file (not too old, not a temp file)
                         for file in files:
                             file_path = os.path.join(it.dest_folder, file)
                             file_age = time.time() - os.path.getmtime(file_path)
-                            if file_age < 300 and not file.startswith('.'):  # Less than 5 minutes old and not hidden
+                            if file_age < 300 and not file.startswith('.'):
                                 it.filename = file
+                                if not it.total:
+                                    try:
+                                        it.total = os.path.getsize(file_path)
+                                    except Exception:
+                                        pass
                                 break
             except Exception:
-                pass  # If we can't determine the filename, leave it as is
+                pass
         if error:
             it.error = error
         await self.db.save_item(it)
@@ -806,6 +826,69 @@ class DownloadManager:
         else:
             self._emit("on_item_failed", it)
         await self.maybe_start_pending()
+    async def _post_process_media(self, it: DownloadItem):
+        if not HAS_PIL:
+            return
+        is_img = any(it.filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp'])
+        if is_img and it.quality and it.quality != "Original":
+             def _process():
+                 try:
+                     fp = os.path.join(it.dest_folder, it.filename)
+                     if not os.path.exists(fp): return
+                     
+                     # Determine format
+                     fmt = None
+                     if it.file_format and it.file_format in ['jpg', 'png', 'webp']:
+                         fmt = it.file_format
+                     
+                     # Quality mapping
+                     q_val = 95
+                     if it.quality == "High": q_val = 85
+                     elif it.quality == "Medium": q_val = 60
+                     elif it.quality == "Low": q_val = 30
+                     
+                     with Image.open(fp) as img:
+                         if fmt:
+                             # Change format
+                             base = os.path.splitext(fp)[0]
+                             new_fp = f"{base}.{fmt.replace('jpg','jpeg')}" # pillow uses jpeg
+                             if fmt == 'jpg': fmt = 'jpeg'
+                             
+                             # Handle transparency for JPEG/JPG
+                             if fmt.lower() in ['jpeg', 'jpg'] and img.mode in ('RGBA', 'P'):
+                                 # Create a white background
+                                 if img.mode == 'P':
+                                     img = img.convert('RGBA')
+                                 background = Image.new('RGB', img.size, (255, 255, 255))
+                                 # Paste using alpha channel as mask
+                                 if 'A' in img.getbands():
+                                     background.paste(img, mask=img.split()[-1])
+                                 else:
+                                     background.paste(img)
+                                 img = background
+                             elif img.mode == 'P':
+                                  img = img.convert('RGB')
+                                 
+                             img.save(new_fp, format=fmt.upper(), quality=q_val)
+                             
+                             # Update filename if changed
+                             if new_fp != fp:
+                                 try:
+                                     os.remove(fp)
+                                 except: pass
+                                 it.filename = os.path.basename(new_fp)
+                         else:
+                             # Just re-save with quality
+                             if img.format == 'JPEG' or (it.filename.lower().endswith('.jpg') or it.filename.lower().endswith('.jpeg')):
+                                 img.save(fp, quality=q_val)
+                             # For PNG/WebP we can't easily set quality like JPEG without other params, but let's try
+                             elif img.format == 'WEBP':
+                                 img.save(fp, quality=q_val)
+                 except Exception as e:
+                     print(f"Image processing error: {e}")
+                     # Don't fail the download, just log
+                     
+             await self.loop.run_in_executor(None, _process)
 
     # libtorrent integration (simplified)
     def _init_libtorrent(self):
@@ -850,6 +933,7 @@ class DownloadManager:
             it.end_time = time.time()
             await self.db.save_item(it)
             self.ui_update(it.id)
+            self._emit("on_item_completed", it)
         except asyncio.CancelledError:
             it.state = "cancelled"
             await self.db.save_item(it)
@@ -864,7 +948,7 @@ class AddDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Add Download")
         self.layout = QVBoxLayout(self)
-        form = QFormLayout()
+        self.form_layout = QFormLayout()
         self.url_edit = QLineEdit()
         if initial_url:
             self.url_edit.setText(initial_url)
@@ -891,29 +975,36 @@ class AddDialog(QDialog):
         self.url_edit.textChanged.connect(self.on_url_changed)
         
         self.is_torrent_cb = QCheckBox("Is torrent / magnet")
-        form.addRow("URL:", self.url_edit)
-        form.addRow("Filename (optional):", self.filename_edit)
+        self.form_layout.addRow("URL:", self.url_edit)
+        self.form_layout.addRow("Filename (optional):", self.filename_edit)
         h = QHBoxLayout(); h.addWidget(self.dest_edit); h.addWidget(self.browse_btn)
-        form.addRow("Destination:", h)
-        form.addRow("Segments:", self.segs_spin)
-        form.addRow("Per-download bandwidth (KB/s, 0=none):", self.bandwidth_spin)
-        form.addRow("Retries:", self.retries_spin)
-        form.addRow("Checksum (SHA256):", self.checksum_edit)
+        self.form_layout.addRow("Destination:", h)
+        self.form_layout.addRow("Segments:", self.segs_spin)
+        self.form_layout.addRow("Per-download bandwidth (KB/s, 0=none):", self.bandwidth_spin)
+        self.form_layout.addRow("Retries:", self.retries_spin)
+        self.form_layout.addRow("Checksum (SHA256):", self.checksum_edit)
         
         # YouTube/yt-dlp options (hidden by default)
-        self.youtube_label = QLabel("YouTube Options (auto-detected):")
+        self.youtube_label = QLabel("Media Options:")
         self.youtube_label.setVisible(False)
-        form.addRow("", self.youtube_label)
+        self.form_layout.addRow("", self.youtube_label)
+        
+        # FFmpeg warning
+        if not shutil.which("ffmpeg"):
+            self.ffmpeg_warning = QLabel("Warning: FFmpeg not found. Audio conversion and some video formats disabled.")
+            self.ffmpeg_warning.setStyleSheet("color: red")
+            self.layout.addWidget(self.ffmpeg_warning)
+            
         self.quality_combo.setVisible(False)
         self.format_combo.setVisible(False)
-        form.addRow("Quality (YouTube):", self.quality_combo)
-        form.addRow("Format (YouTube):", self.format_combo)
-        form.addRow("Schedule:", self.schedule_dt)
-        form.addRow("Auth username:", self.auth_user); form.addRow("Auth password:", self.auth_pass)
-        form.addRow("Cookies (JSON or name=value lines):", self.cookies_text)
-        form.addRow("Proxy (http://proxy:port):", self.proxy_edit)
-        form.addRow("", self.is_torrent_cb)
-        self.layout.addLayout(form)
+        self.form_layout.addRow("Quality (YouTube):", self.quality_combo)
+        self.form_layout.addRow("Format (YouTube):", self.format_combo)
+        self.form_layout.addRow("Schedule:", self.schedule_dt)
+        self.form_layout.addRow("Auth username:", self.auth_user); self.form_layout.addRow("Auth password:", self.auth_pass)
+        self.form_layout.addRow("Cookies (JSON or name=value lines):", self.cookies_text)
+        self.form_layout.addRow("Proxy (http://proxy:port):", self.proxy_edit)
+        self.form_layout.addRow("", self.is_torrent_cb)
+        self.layout.addLayout(self.form_layout)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.layout.addWidget(self.buttons)
         self.browse_btn.clicked.connect(self.on_browse)
@@ -921,37 +1012,70 @@ class AddDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         
         # Initial validation check
-        self.buttons.button(QDialogButtonBox.Ok).setEnabled(True) 
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(True)
+        
+        # Ensure correct initial state
+        self.on_url_changed(self.url_edit.text()) 
 
     def on_url_changed(self, text):
-        # Show YouTube options only if URL contains YouTube domain
         is_yt = "youtube.com" in text or "youtu.be" in text
         is_img = any(text.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp'])
         is_audio = any(text.lower().endswith(ext) for ext in ['.mp3', '.wav', '.flac', '.m4a'])
+        is_http = text.startswith("http://") or text.startswith("https://")
+        is_video_generic = is_http and not is_img and not is_audio and not text.endswith(".torrent") and not text.startswith("magnet:")
         
-        # Show options based on type
-        self.youtube_label.setVisible(is_yt or is_img or is_audio)
-        self.quality_combo.setVisible(is_yt or is_img or is_audio)
-        self.format_combo.setVisible(is_yt or is_img or is_audio)
+        visible = is_yt or is_img or is_audio or is_video_generic
+        self.youtube_label.setVisible(visible)
         
-        if is_yt:
-             self.youtube_label.setText("YouTube Options:")
-             self.quality_combo.clear()
-             self.quality_combo.addItems(["Best", "1080p", "720p", "360p", "Audio Only"])
-             self.format_combo.clear()
-             self.format_combo.addItems(["mp4", "mkv", "webm"])
-        elif is_img:
-             self.youtube_label.setText("Image Options:")
-             self.quality_combo.clear()
-             self.quality_combo.addItems(["Original", "High", "Medium", "Low"])
-             self.format_combo.clear()
-             self.format_combo.addItems(["jpg", "png", "webp"])
-        elif is_audio:
-             self.youtube_label.setText("Audio Options:")
-             self.quality_combo.clear()
-             self.quality_combo.addItems(["Original", "High (320k)", "Medium (192k)", "Low (128k)"])
-             self.format_combo.clear()
-             self.format_combo.addItems(["mp3", "wav", "m4a", "flac"])
+        # Use setRowVisible for cleaner toggle in QFormLayout
+        self.form_layout.setRowVisible(self.quality_combo, visible)
+        self.form_layout.setRowVisible(self.format_combo, visible)
+        
+        if visible:
+            q_label = self.form_layout.labelForField(self.quality_combo)
+            f_label = self.form_layout.labelForField(self.format_combo)
+            
+            if is_yt:
+                 self.youtube_label.setText("YouTube Options:")
+                 if q_label: q_label.setText("Quality (YouTube):")
+                 if f_label: f_label.setText("Format (YouTube):")
+                 
+                 # Only repopulate if needed (rudimentary check to avoid resetting selection)
+                 if self.quality_combo.count() == 0 or self.quality_combo.itemText(0) != "Best":
+                     self.quality_combo.clear()
+                     self.quality_combo.addItems(["Best", "1080p", "720p", "360p", "Audio Only"])
+                     self.format_combo.clear()
+                     self.format_combo.addItems(["mp4", "mkv", "webm"])
+            elif is_video_generic:
+                 self.youtube_label.setText("Video Options:")
+                 if q_label: q_label.setText("Quality (Video):")
+                 if f_label: f_label.setText("Format (Video):")
+                 
+                 if self.quality_combo.count() == 0 or self.quality_combo.itemText(0) not in ["Best", "1080p", "720p", "360p"]:
+                     self.quality_combo.clear()
+                     self.quality_combo.addItems(["Best", "1080p", "720p", "360p"])
+                     self.format_combo.clear()
+                     self.format_combo.addItems(["mp4", "mkv", "webm"])
+            elif is_img:
+                 self.youtube_label.setText("Image Options:")
+                 if q_label: q_label.setText("Quality (Image):")
+                 if f_label: f_label.setText("Format (Image):")
+                 
+                 if self.quality_combo.count() == 0 or self.quality_combo.itemText(0) != "Original":
+                     self.quality_combo.clear()
+                     self.quality_combo.addItems(["Original", "High", "Medium", "Low"])
+                     self.format_combo.clear()
+                     self.format_combo.addItems(["jpg", "png", "webp"])
+            elif is_audio:
+                 self.youtube_label.setText("Audio Options:")
+                 if q_label: q_label.setText("Quality (Audio):")
+                 if f_label: f_label.setText("Format (Audio):")
+                 
+                 if self.quality_combo.count() == 0 or self.quality_combo.itemText(0) != "Original":
+                     self.quality_combo.clear()
+                     self.quality_combo.addItems(["Original", "High (320k)", "Medium (192k)", "Low (128k)"])
+                     self.format_combo.clear()
+                     self.format_combo.addItems(["mp3", "wav", "m4a", "flac"])
 
     def on_quality_changed(self, text):
         # Only update format combo for YouTube "Audio Only" switch, preserve others
@@ -1119,12 +1243,37 @@ class DetailDialog(QDialog):
         y = [v/1024.0 for v in data]
         self.plot.setData(y)
 
+class Toast(QWidget):
+    def __init__(self, parent, text, timeout_ms=3000):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        layout = QHBoxLayout(self)
+        label = QLabel(text)
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(16, 16)
+        close_btn.setFlat(True)
+        close_btn.setStyleSheet("QPushButton { border: none; color: white; font-weight: bold; }"
+                                "QPushButton:hover { color: #ffaaaa; }")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(label)
+        layout.addWidget(close_btn)
+        self.setStyleSheet("background-color: rgba(0, 0, 0, 200); color: white; border-radius: 6px; padding: 6px 10px;")
+        self.adjustSize()
+        if parent is not None:
+            g = parent.geometry()
+            x = g.x() + g.width() - self.width() - 20
+            y = g.y() + g.height() - self.height() - 40
+            self.move(x, y)
+        QTimer.singleShot(timeout_ms, self.close)
+
 class DownloadCompleteDialog(QDialog):
     def __init__(self, item: DownloadItem, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Download Finished")
         self.resize(400, 200)
         self.layout = QVBoxLayout(self)
+        self.item = item
         
         lbl = QLabel(f"Download finished:\n{item.filename}")
         lbl.setWordWrap(True)
@@ -1160,7 +1309,7 @@ class DownloadCompleteDialog(QDialog):
         form.addRow("Size:", QLabel(size_str))
         
         # Add location display
-        location_str = os.path.join(self.item.dest_folder, self.item.filename) if self.item.filename else self.item.dest_folder
+        location_str = os.path.join(item.dest_folder, item.filename) if item.filename else item.dest_folder
         location_lbl = QLabel(location_str)
         location_lbl.setWordWrap(True)
         location_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1177,8 +1326,6 @@ class DownloadCompleteDialog(QDialog):
         
         self.open_btn.clicked.connect(self.on_open)
         self.finish_btn.clicked.connect(self.accept)
-        
-        self.item = item
 
     def on_open(self):
         try:
@@ -1252,6 +1399,7 @@ class MainWindow(QWidget):
         self.setLayout(v)
         self.manager = DownloadManager(self.loop, self.ui_update)
         self.manager.register_hook("on_item_completed", self.on_download_completed)
+        self._active_toasts = []
         self.add_btn.clicked.connect(self.on_add)
         self.start_all_btn.clicked.connect(lambda: self.manager.start_all())
         self.pause_all_btn.clicked.connect(self.on_pause_all)
@@ -1277,7 +1425,11 @@ class MainWindow(QWidget):
             self.manager.resume_item(iid)
 
     def on_download_completed(self, item: DownloadItem):
-        # Schedule dialog to show later so we don't block the download manager loop
+        msg = item.filename or os.path.basename(item.url) or "Download"
+        text = f"{msg} has finished downloading."
+        toast = Toast(self, text)
+        self._active_toasts.append(toast)
+        toast.show()
         QTimer.singleShot(100, lambda: self._show_complete_dialog(item))
 
     def _show_complete_dialog(self, item: DownloadItem):
@@ -1469,6 +1621,9 @@ class MainWindow(QWidget):
             # Errors
             err_str = it.error or ""
             item_err = self.table.item(r, 8)
+
+
+
             if not item_err:
                 self.table.setItem(r, 8, QTableWidgetItem(err_str))
             else:
