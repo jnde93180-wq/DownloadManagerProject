@@ -1078,13 +1078,12 @@ class AddDialog(QDialog):
                      self.format_combo.addItems(["mp3", "wav", "m4a", "flac"])
 
     def on_quality_changed(self, text):
-        # Only update format combo for YouTube "Audio Only" switch, preserve others
         url_text = self.url_edit.text()
         if "youtube.com" in url_text or "youtu.be" in url_text:
             self.format_combo.clear()
             if text == "Audio Only":
                 self.format_combo.addItems(["mp3", "m4a", "wav"])
-            else: # Video
+            else:
                 self.format_combo.addItems(["mp4", "mkv", "webm"])
 
     def on_browse(self):
@@ -1093,7 +1092,6 @@ class AddDialog(QDialog):
             self.dest_edit.setText(folder)
 
     def accept(self):
-        # Validate YouTube options if URL is YouTube
         url_text = self.url_edit.text().strip()
         if "youtube.com" in url_text or "youtu.be" in url_text:
              if not self.quality_combo.currentText():
@@ -1118,18 +1116,19 @@ class AddDialog(QDialog):
         scheduled = self.schedule_dt.dateTime().toPython()
         bw = self.bandwidth_spin.value()
         
-        # Only include quality/format if URL is YouTube
         quality = None
         file_fmt = None
-        if "youtube.com" in url or "youtu.be" in url:
+        is_yt = "youtube.com" in url or "youtu.be" in url
+        is_img = any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp'])
+        is_audio = any(url.lower().endswith(ext) for ext in ['.mp3', '.wav', '.flac', '.m4a'])
+        is_http = url.startswith("http://") or url.startswith("https://")
+        is_video_generic = is_http and not is_img and not is_audio and not url.endswith(".torrent") and not url.startswith("magnet:")
+
+        if is_yt or is_video_generic:
             quality = self.quality_combo.currentText()
             if not quality or quality == "Select Quality...": quality = "Best"
             file_fmt = self.format_combo.currentText()
             if not file_fmt or file_fmt == "Select Format...": file_fmt = None
-        else:
-            # For non-YouTube URLs, use sensible defaults
-            quality = "Best"
-            file_fmt = None
 
         return {
             "url": url,
