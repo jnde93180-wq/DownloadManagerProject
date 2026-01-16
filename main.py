@@ -55,10 +55,14 @@ DEFAULT_SEGMENTS = 4
 DEFAULT_CHUNK = 64 * 1024  # 64 KB
 HTTP_SERVER_PORT = 8765
 
-# Add local ffmpeg to PATH
-ffmpeg_path = os.path.join(os.path.dirname(__file__), "ffmpeg")
-if os.path.exists(ffmpeg_path):
-    os.environ["PATH"] += os.pathsep + ffmpeg_path
+if getattr(sys, "frozen", False):
+    _base_dir = Path(sys.executable).parent
+else:
+    _base_dir = Path(__file__).resolve().parent
+
+ffmpeg_path = _base_dir / "ffmpeg"
+if ffmpeg_path.exists():
+    os.environ["PATH"] += os.pathsep + str(ffmpeg_path)
 
 
 def is_valid_url(url: str) -> bool:
