@@ -49,6 +49,7 @@ try:
 except Exception:
     HAS_LIBTORRENT = False
 
+APP_VERSION = "1.0.0"
 APP_DB = os.path.join(os.path.dirname(__file__), "downloads.db")
 DEFAULT_SEGMENTS = 4
 DEFAULT_CHUNK = 64 * 1024  # 64 KB
@@ -1366,7 +1367,7 @@ class MainWindow(QWidget):
     def __init__(self, loop):
         super().__init__()
         self.loop = loop
-        self.setWindowTitle("Download Manager — Enhanced Prototype")
+        self.setWindowTitle(f"Download Manager — Enhanced Prototype v{APP_VERSION}")
         self.resize(1100, 600)
         v = QVBoxLayout(self)
         h = QHBoxLayout()
